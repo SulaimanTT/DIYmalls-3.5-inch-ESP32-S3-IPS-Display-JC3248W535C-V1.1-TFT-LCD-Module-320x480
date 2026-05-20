@@ -1,22 +1,17 @@
-#include <Arduino_GFX_Library.h>
-#include <Wire.h>
+DISPLAY (AXS15231B, QSPI)
+-------------------------
+QSPI_CS   -> GPIO 45
+QSPI_SCK  -> GPIO 47
+QSPI_D0   -> GPIO 21
+QSPI_D1   -> GPIO 48
+QSPI_D2   -> GPIO 40
+QSPI_D3   -> GPIO 39
+TFT_BL    -> GPIO 1
 
-// --- Konfiguracja Wyświetlacza ---
-#define TFT_BL 1
-#define QSPI_CS 45
-#define QSPI_SCK 47
-#define QSPI_D0 21
-#define QSPI_D1 48
-#define QSPI_D2 40
-#define QSPI_D3 39
-
-// --- Konfiguracja Dotyku (I2C) ---
-#define TOUCH_I2C_ADD 0x3B
-#define TOUCH_SDA 4
-#define TOUCH_SCL 8
-#define TOUCH_INT 3
-#define TOUCH_RST 38
-
-Arduino_DataBus *bus = new Arduino_ESP32QSPI(QSPI_CS, QSPI_SCK, QSPI_D0, QSPI_D1, QSPI_D2, QSPI_D3);
-Arduino_GFX *g = new Arduino_AXS15231B(bus, -1, 0, false, 320, 480);
-Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g);
+TOUCH PANEL (I²C)
+-----------------
+SDA       -> GPIO 4
+SCL       -> GPIO 8
+INT       -> GPIO 3
+RST       -> GPIO 38
+I2C ADDR  -> 0x3B
