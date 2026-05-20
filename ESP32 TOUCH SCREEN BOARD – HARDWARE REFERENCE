@@ -1,0 +1,121 @@
+BOARD OVERVIEW
+Your board consists of:
+
+ESP32 microcontroller
+
+AXS15231B 320x480 LCD display (QSPI interface)
+
+Capacitive touch panel (I2C interface)
+
+Backlight control pin
+
+The ESP32 controls both the display and the touch panel.
+
+––––––––––––––––––––––––––––––––––––––––––––––––––
+DISPLAY (AXS15231B LCD DRIVER)
+Interface: QSPI (Quad SPI)
+Resolution: 320 x 480
+Color: 16-bit RGB565
+
+DISPLAY → ESP32 PIN MAP
+QSPI_CS  -> GPIO 45
+QSPI_SCK -> GPIO 47
+QSPI_D0  -> GPIO 21
+QSPI_D1  -> GPIO 48
+QSPI_D2  -> GPIO 40
+QSPI_D3  -> GPIO 39
+TFT_BL   -> GPIO 1 (Backlight ON/OFF)
+
+DISPLAY INITIALISATION (CONCEPT)
+
+Use Arduino_GFX_Library
+
+Create QSPI bus
+
+Create AXS15231B display object
+
+Begin display
+
+Set rotation
+
+Turn on backlight
+
+DRAWING TEXT (CONCEPT)
+
+Set text color
+
+Set text size
+
+Set cursor position
+
+Print text
+
+––––––––––––––––––––––––––––––––––––––––––––––––––
+TOUCH PANEL (CAPACITIVE, I2C)
+Interface: I2C
+Touch controller address: 0x3B
+
+TOUCH → ESP32 PIN MAP
+SDA  -> GPIO 4
+SCL  -> GPIO 8
+INT  -> GPIO 3
+RST  -> GPIO 38
+
+TOUCH INITIALISATION (CONCEPT)
+
+Begin I2C with SDA=4, SCL=8
+
+Reset touch controller using GPIO 38
+
+READING TOUCH (CONCEPT)
+
+Send special 11-byte command to address 0x3B
+
+Read 8 bytes of touch data
+
+Extract X and Y coordinates
+
+Rotate coordinates because screen is mounted upside-down
+
+Return true if touch detected
+
+––––––––––––––––––––––––––––––––––––––––––––––––––
+BACKLIGHT CONTROL
+Pin: GPIO 1
+HIGH = backlight on
+LOW = backlight off
+
+––––––––––––––––––––––––––––––––––––––––––––––––––
+FULL PIN SUMMARY
+DISPLAY (AXS15231B, QSPI)
+QSPI_CS  -> 45
+QSPI_SCK -> 47
+QSPI_D0  -> 21
+QSPI_D1  -> 48
+QSPI_D2  -> 40
+QSPI_D3  -> 39
+TFT_BL   -> 1
+
+TOUCH PANEL (I2C)
+SDA      -> 4
+SCL      -> 8
+INT      -> 3
+RST      -> 38
+I2C ADDR -> 0x3B
+
+––––––––––––––––––––––––––––––––––––––––––––––––––
+MINIMAL WORKFLOW SUMMARY
+
+Initialise display (QSPI)
+
+Initialise touch (I2C)
+
+Turn on backlight
+
+Draw graphics/text
+
+Poll touch controller
+
+Convert raw touch to screen coordinates
+
+Use touch input to control UI
