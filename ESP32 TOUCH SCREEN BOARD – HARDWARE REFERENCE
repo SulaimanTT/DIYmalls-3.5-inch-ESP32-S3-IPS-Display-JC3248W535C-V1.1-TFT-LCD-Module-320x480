@@ -1,121 +1,49 @@
-BOARD OVERVIEW
-Your board consists of:
-
-ESP32 microcontroller
-
-AXS15231B 320x480 LCD display (QSPI interface)
-
-Capacitive touch panel (I2C interface)
-
-Backlight control pin
-
-The ESP32 controls both the display and the touch panel.
-
 ––––––––––––––––––––––––––––––––––––––––––––––––––
-DISPLAY (AXS15231B LCD DRIVER)
-Interface: QSPI (Quad SPI)
-Resolution: 320 x 480
-Color: 16-bit RGB565
-
-DISPLAY → ESP32 PIN MAP
-QSPI_CS  -> GPIO 45
-QSPI_SCK -> GPIO 47
-QSPI_D0  -> GPIO 21
-QSPI_D1  -> GPIO 48
-QSPI_D2  -> GPIO 40
-QSPI_D3  -> GPIO 39
-TFT_BL   -> GPIO 1 (Backlight ON/OFF)
-
-DISPLAY INITIALISATION (CONCEPT)
-
-Use Arduino_GFX_Library
-
-Create QSPI bus
-
-Create AXS15231B display object
-
-Begin display
-
-Set rotation
-
-Turn on backlight
-
-DRAWING TEXT (CONCEPT)
-
-Set text color
-
-Set text size
-
-Set cursor position
-
-Print text
-
+ESP32 TOUCH SCREEN BOARD HARDWARE DESCRIPTION
 ––––––––––––––––––––––––––––––––––––––––––––––––––
-TOUCH PANEL (CAPACITIVE, I2C)
-Interface: I2C
-Touch controller address: 0x3B
 
-TOUCH → ESP32 PIN MAP
-SDA  -> GPIO 4
-SCL  -> GPIO 8
-INT  -> GPIO 3
-RST  -> GPIO 38
+The board is built around an ESP32 microcontroller.
+It controls a 320x480 LCD display that uses an AXS15231B display driver.
+The display communicates with the ESP32 using a QSPI interface.
+QSPI uses six pins: one clock pin, one chip select pin, and four data pins.
+The display also has a backlight pin that must be set high to turn the screen on.
 
-TOUCH INITIALISATION (CONCEPT)
+The display pins are connected to the ESP32 as follows.
+The chip select pin is connected to GPIO 45.
+The clock pin is connected to GPIO 47.
+The QSPI data lines are connected to GPIO 21, GPIO 48, GPIO 40, and GPIO 39.
+The backlight pin is connected to GPIO 1.
 
-Begin I2C with SDA=4, SCL=8
+To use the display in code, the Arduino GFX library is required.
+The display is created using an Arduino ESP32 QSPI bus object and an AXS15231B display object.
+The display must be initialised with begin, and the rotation is usually set to 2 because the screen is mounted upside down.
+After initialisation, text can be drawn by setting the text color, text size, cursor position, and printing text.
 
-Reset touch controller using GPIO 38
+The touch panel is capacitive and uses an I2C touch controller.
+The touch controller communicates with the ESP32 using the I2C bus.
+The SDA line is connected to GPIO 4.
+The SCL line is connected to GPIO 8.
+The touch controller also has an interrupt pin on GPIO 3 and a reset pin on GPIO 38.
+The I2C address of the touch controller is 0x3B.
 
-READING TOUCH (CONCEPT)
+To read touch data, the ESP32 sends a specific command sequence to the touch controller over I2C.
+The controller returns eight bytes of data that contain the touch state and the X and Y coordinates.
+Because the display is rotated, the coordinates must be inverted by subtracting them from the screen width and height.
 
-Send special 11-byte command to address 0x3B
+The backlight is controlled by GPIO 1.
+Setting this pin high turns the backlight on.
+Setting it low turns the backlight off.
 
-Read 8 bytes of touch data
+The full pin mapping for the board is as follows.
+Display chip select is on GPIO 45.
+Display clock is on GPIO 47.
+Display data lines are on GPIO 21, GPIO 48, GPIO 40, and GPIO 39.
+Backlight is on GPIO 1.
+Touch SDA is on GPIO 4.
+Touch SCL is on GPIO 8.
+Touch interrupt is on GPIO 3.
+Touch reset is on GPIO 38.
+Touch I2C address is 0x3B.
 
-Extract X and Y coordinates
-
-Rotate coordinates because screen is mounted upside-down
-
-Return true if touch detected
-
-––––––––––––––––––––––––––––––––––––––––––––––––––
-BACKLIGHT CONTROL
-Pin: GPIO 1
-HIGH = backlight on
-LOW = backlight off
-
-––––––––––––––––––––––––––––––––––––––––––––––––––
-FULL PIN SUMMARY
-DISPLAY (AXS15231B, QSPI)
-QSPI_CS  -> 45
-QSPI_SCK -> 47
-QSPI_D0  -> 21
-QSPI_D1  -> 48
-QSPI_D2  -> 40
-QSPI_D3  -> 39
-TFT_BL   -> 1
-
-TOUCH PANEL (I2C)
-SDA      -> 4
-SCL      -> 8
-INT      -> 3
-RST      -> 38
-I2C ADDR -> 0x3B
-
-––––––––––––––––––––––––––––––––––––––––––––––––––
-MINIMAL WORKFLOW SUMMARY
-
-Initialise display (QSPI)
-
-Initialise touch (I2C)
-
-Turn on backlight
-
-Draw graphics/text
-
-Poll touch controller
-
-Convert raw touch to screen coordinates
-
-Use touch input to control UI
+To draw text on the screen, the program clears the screen, sets the text color, sets the text size, positions the cursor, and prints the text.
+To read touch input, the program calls the touch read function, which returns true if a touch is detected and outputs the X and Y coordinates.
