@@ -1,1 +1,9 @@
+#ifndef SECRETS_H
+#define SECRETS_H
 
+// --- Hidden Network & API Credentials ---
+#define SECRET_SSID     "YOUR_ACTUAL_WIFI_NAME"
+#define SECRET_PASSWORD "YOUR_ACTUAL_WIFI_PASSWORD"
+#define SECRET_API_KEY  "YOUR_ACTUAL_32_DIGIT_OPENWEATHER_KEY"
+
+#endif
