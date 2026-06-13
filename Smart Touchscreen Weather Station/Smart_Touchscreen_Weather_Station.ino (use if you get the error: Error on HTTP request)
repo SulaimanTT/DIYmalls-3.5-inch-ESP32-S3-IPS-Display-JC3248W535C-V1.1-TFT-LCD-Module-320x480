@@ -5,7 +5,8 @@
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h> // Required for secure network connections
 
-// Use if you get the error: 'Error on HTTP request' in the Serial monitor for the file 
+// Use if you get the error 'Error on HTTP request' in the Serial monitor for the file 'Smart_Touchscreen_Weather_Station.ino'.
+// This code blocks the Wi-fi router's firewall by telling the router that Open Weather Maps is a trusted api.
 
 // Link to the credentials tab
 #include "secrets.h"
