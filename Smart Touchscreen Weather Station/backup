@@ -1,0 +1,254 @@
+#include <Arduino_GFX_Library.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <WiFiClientSecure.h> // Required for secure network connections
+
+// Link to the credentials tab
+#include "secrets.h"
+
+// --- Display Configuration ---
+#define TFT_BL 1
+#define QSPI_CS 45
+#define QSPI_SCK 47
+#define QSPI_D0 21
+#define QSPI_D1 48
+#define QSPI_D2 40
+#define QSPI_D3 39
+
+// --- Touch Configuration (I2C) ---
+#define TOUCH_I2C_ADD 0x3B
+#define TOUCH_SDA 4
+#define TOUCH_SCL 8
+#define TOUCH_INT 3
+#define TOUCH_RST 38
+
+// Network credentials loaded automatically from secrets.h
+const char* ssid     = SECRET_SSID;
+const char* password = SECRET_PASSWORD;
+String apiKey        = SECRET_API_KEY;
+
+// Local geographic configuration
+String cityName      = "London";
+String country       = "UK";
+
+// Initialize the data bus and canvas (With rotation set to '2' -> 180 degrees)
+Arduino_DataBus *bus = new Arduino_ESP32QSPI(QSPI_CS, QSPI_SCK, QSPI_D0, QSPI_D1, QSPI_D2, QSPI_D3);
+Arduino_GFX *g = new Arduino_AXS15231B(bus, -1, 2, false, 320, 480); 
+Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g);
+
+// Secure HTTPS string layout to prevent local handshake failures
+String weatherUrl = "https://openweathermap.org" + cityName + "," + country + "&appid=" + apiKey + "&units=metric";
+
+// Global variables to store weather data
+float currentTemp = 0.0;
+int currentHumidity = 0;
+String currentDesc = "Loading...";
+bool hasData = false;
+
+// Helper function to read touch inputs adapted for 180-degree rotation
+bool getTouch(int &x, int &y) {
+  uint8_t read_cmd[] = {0xB5, 0xAB, 0xA5, 0x5A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00};
+  uint8_t data[8] = {0};
+
+  Wire.beginTransmission(TOUCH_I2C_ADD);
+  Wire.write(read_cmd, sizeof(read_cmd));
+  Wire.endTransmission();
+
+  Wire.requestFrom(TOUCH_I2C_ADD, 8);
+  if (Wire.available() == 8) {
+    for (int i = 0; i < 8; i++) data[i] = Wire.read();
+
+    if (data[0] == 0 && data[1] != 0) {
+      int tx = ((data[2] & 0x0F) << 8) | data[3];
+      int ty = ((data[4] & 0x0F) << 8) | data[5];
+      
+      // Filter out erroneous readings
+      if (tx <= 2 || ty <= 2 || tx >= 318 || ty >= 478) return false;
+
+      // Mathematical inversion of touch coordinates for 180-degree flip
+      x = 320 - tx;
+      y = 480 - ty;
+      return true;
+    }
+  }
+  return false;
+}
+
+// Function responsible for fetching JSON data securely and processing it
+void fetchWeatherData() {
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFiClientSecure *client = new WiFiClientSecure;
+    
+    if (client) {
+      // Force the client to skip strict SSL certificate validation
+      client->setInsecure();
+      
+      HTTPClient http;
+      http.begin(*client, weatherUrl);
+      int httpCode = http.GET();
+      
+      // Check if the server responded
+      if (httpCode > 0) {
+        Serial.print("HTTP Response Code: ");
+        Serial.println(httpCode);
+        
+        if (httpCode == 200) { // HTTP OK
+          String payload = http.getString();
+          DynamicJsonDocument doc(2048);
+          deserializeJson(doc, payload);
+          
+          currentTemp = doc["main"]["temp"];
+          currentHumidity = doc["main"]["humidity"];
+          
+          const char* desc = doc["weather"][0]["description"]; // Corrected index array access
+          currentDesc = String(desc);
+          currentDesc.toUpperCase(); // Prettify the string layout to uppercase
+          hasData = true;
+        } else {
+          // Server rejected the request (e.g., 401 Unauthorized)
+          String errorPayload = http.getString();
+          Serial.print("Server Error Details: ");
+          Serial.println(errorPayload);
+          currentDesc = "API ERROR " + String(httpCode);
+          hasData = false;
+        }
+      } else {
+        // Physical layer or connection failures (Negative code values)
+        Serial.print("Connection Failed. Error code: ");
+        Serial.println(http.errorToString(httpCode).c_str());
+        currentDesc = "CONN FAILED";
+        hasData = false;
+      }
+      http.end();
+      delete client; // Free system memory allocation
+    }
+  } else {
+    Serial.println("Wi-Fi Connection Lost!");
+    currentDesc = "NO WI-FI";
+    hasData = false;
+  }
+}
+
+// Draw the user interface (UI) on the memory Canvas
+void drawUI() {
+  gfx->fillScreen(0x0000); // Black background
+
+  // Top Header: City Name
+  gfx->setCursor(20, 40);
+  gfx->setTextSize(3);
+  gfx->setTextColor(0xFFE0); // Yellow
+  gfx->print(cityName);
+  gfx->print(", ");
+  gfx->print(country);
+
+  // Center Area: Temperature
+  gfx->setCursor(20, 130);
+  gfx->setTextSize(7);
+  gfx->setTextColor(0xFFFF); // White
+  if (hasData) {
+    gfx->print(currentTemp, 1);
+    gfx->print(" C");
+  } else {
+    gfx->print("--.- C");
+  }
+
+  // Weather Condition Text
+  gfx->setCursor(20, 240);
+  gfx->setTextSize(2);
+  gfx->setTextColor(0x07E0); // Green
+  gfx->print("COND: ");
+  gfx->print(currentDesc);
+
+  // Air Humidity
+  gfx->setCursor(20, 280);
+  gfx->setTextSize(2);
+  gfx->setTextColor(0x001F); // Blue
+  gfx->print("HUMIDITY: ");
+  gfx->print(currentHumidity);
+  gfx->print("%");
+
+  // Interactive Button at the bottom: "REFRESH"
+  gfx->fillRect(20, 380, 280, 50, 0xF800); // Red rectangle
+  gfx->setCursor(105, 395);
+  gfx->setTextSize(2);
+  gfx->setTextColor(0xFFFF); // White text
+  gfx->print("TAP TO REFRESH");
+
+  gfx->flush(); // Push the complete memory frame buffer to the physical panel
+}
+
+unsigned long lastUpdate = 0;
+const unsigned long updateInterval = 900000; // Automatic refresh cycle every 15 minutes
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  pinMode(TOUCH_RST, OUTPUT);
+  digitalWrite(TOUCH_RST, HIGH); 
+  delay(100);
+
+  Wire.begin(TOUCH_SDA, TOUCH_SCL);
+
+  if (!gfx->begin()) {
+    Serial.println("Error running gfx->begin()!");
+    while(1);
+  }
+
+  // Visual Wi-Fi connection boot screen
+  gfx->fillScreen(0x0000);
+  gfx->setCursor(20, 40);
+  gfx->setTextSize(2);
+  gfx->setTextColor(0xFFFF);
+  gfx->print("Connecting to Wi-Fi...");
+  gfx->flush();
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWi-Fi Connected successfully.");
+
+  // Run the initial data query on startup
+  fetchWeatherData();
+  drawUI();
+  lastUpdate = millis();
+}
+
+void loop() {
+  int tx, ty;
+  
+  // Check if the user touched the interactive "REFRESH" area
+  if (getTouch(tx, ty)) {
+    // Target button boundaries: X from 20 to 300, Y from 380 to 430
+    if (tx > 20 && tx < 300 && ty > 380 && ty < 430) {
+      
+      // Temporary style modification for a visual click confirmation indicator
+      gfx->fillRect(20, 380, 280, 50, 0x7BEF); // Gray rectangle
+      gfx->setCursor(115, 395);
+      gfx->setTextSize(2);
+      gfx->setTextColor(0x0000); // Black text
+      gfx->print("REFRESHING...");
+      gfx->flush();
+      
+      fetchWeatherData();
+      drawUI();
+      lastUpdate = millis(); // Reset the background automatic interval timer
+      delay(500); // Anti-bounce delay to prevent double triggers
+    }
+  }
+
+  // Background non-blocking update interval check
+  if (millis() - lastUpdate >= updateInterval) {
+    fetchWeatherData();
+    drawUI();
+    lastUpdate = millis();
+  }
+
+  delay(10);
+}
