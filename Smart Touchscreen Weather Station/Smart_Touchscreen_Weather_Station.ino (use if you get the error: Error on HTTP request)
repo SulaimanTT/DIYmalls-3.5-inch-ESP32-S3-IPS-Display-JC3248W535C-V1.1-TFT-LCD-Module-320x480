@@ -5,6 +5,8 @@
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h> // Required for secure network connections
 
+// Use if you get the error: 'Error on HTTP request' in the Serial monitor for the file 
+
 // Link to the credentials tab
 #include "secrets.h"
 
