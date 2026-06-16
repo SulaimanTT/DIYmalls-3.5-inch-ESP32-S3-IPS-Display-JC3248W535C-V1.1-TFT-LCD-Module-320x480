@@ -15,3 +15,95 @@ SCL       -> GPIO 8
 INT       -> GPIO 3
 RST       -> GPIO 38
 I2C ADDR  -> 0x3B
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Hardware Pinout Configuration (SPI Bus)
+
+The micro SD card slot on this DIYmalls 3.5" ESP32-S3 (JC3248W535C) development board communicates using the standard **SPI (Serial Peripheral Interface)** bus. The data lines are shared across the hardware platform, using standard 4-wire synchronization rules:
+
+| Signal Name | ESP32-S3 GPIO | Description |
+|:---|:---:|:---|
+| **SD_CS** | **9** | Chip Select (Active Low listener trigger) |
+| **SD_MOSI** | **11** | Master Out Slave In (Data line from ESP32 to SD Card) |
+| **SD_MISO** | **13** | Master In Slave Out (Data line from SD Card to ESP32) |
+| **SD_SCK** | **12** | Serial Clock (Synchronizing system hardware beat) |
+
+---
+
+## Code Reference Example
+
+Below is the software initialization blueprint required to mount the storage module cleanly on Core 1 while preventing background memory loop conflicts.
+
+```cpp
+#include <SPI.h>
+#include <SD.h>
+#include "FS.h"
+
+// Explicit hardware bus pin definition constraints
+#define SD_CS   9
+#define SD_MOSI 11
+#define SD_MISO 13
+#define SD_SCK  12
+
+// Declare an explicit SPI instance class to prevent driver cross-talk
+SPIClass spiSD(HSPI);
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) { delay(10); }
+
+  Serial.println("Initializing Micro SD Storage System...");
+
+  // 1. Assign pins directly to the targeted SPI instance
+  spiSD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+
+  // 2. Initialise and mount the file system architecture
+  if (!SD.begin(SD_CS, spiSD)) {
+    Serial.println("SD SPI Mount Failed! Check physical card insertion.");
+    while (1); // Halt execution if card is missing or corrupted
+  }
+
+  Serial.println("SD Card mounted successfully. Ready for read/write operations.");
+
+  // 3. Simple file validation test
+  File file = SD.open("/test_log.txt", FILE_WRITE);
+  if (file) {
+    file.println("ESP32-S3 Storage initialization complete.");
+    file.close();
+    Serial.println("File system write test passed.");
+  }
+}
+
+void loop() {
+  // FreeRTOS tasks handle structural execution; loop remains empty
+}
+```
+
+---
+
+## Architectural Deep Dive
+
+### 1. Chip Select (CS) - GPIO 9
+The `SD_CS` pin functions as a hardware toggle switch. Because several components on this board share the exact same SPI interface buses, the ESP32-S3 uses this line to isolate specific data traffic. Pulling this pin **LOW (0V)** opens the digital gateway for the SD card to send or receive information. Returning it to a **HIGH (3.3V)** state silences the card completely, freeing up the shared data highway so other peripherals can communicate.
+
+### 2. Master Out Slave In (MOSI) - GPIO 11
+This is a unidirectional outbound data line flowing from the ESP32-S3 processor straight to the storage device. When the calendar engine finishes downloading an interactive `.ics` update from a server over Wi-Fi, it pushes the parsed stream data down this channel to overwrite or save your `/calendar.ics` file inside the local storage blocks.
+
+### 3. Master In Slave Out (MISO) - GPIO 13
+This is a unidirectional inbound data line flowing from the micro SD card chip back to the central ESP32-S3 processor core. Every time you tap the touchscreen navigation buttons (`<` or `>`) to flip calendar pages, the runtime environment reads from this stream to check dates and look for scheduled items without needing to query the internet.
+
+### 4. Serial Clock (SCK) - GPIO 12
+The clock pin produces a continuous, strict metronome beat managed by the ESP32-S3. Digital storage processes require microsecond-accurate data synchronization. With every rising or falling edge pulse driven across Pin 12, exactly one binary bit of calendar text is synchronized across the MOSI and MISO paths, preventing corrupted data frames during active operations.
