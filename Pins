@@ -38,7 +38,7 @@ The micro SD card slot on this DIYmalls 3.5" ESP32-S3 (JC3248W535C) development 
 
 | Signal Name | ESP32-S3 GPIO | Description |
 |:---|:---:|:---|
-| **SD_CS** | **9** | Chip Select (Active Low listener trigger) |
+| **SD_CS** | **10** | Chip Select (Active Low listener trigger) |
 | **SD_MOSI** | **11** | Master Out Slave In (Data line from ESP32 to SD Card) |
 | **SD_MISO** | **13** | Master In Slave Out (Data line from SD Card to ESP32) |
 | **SD_SCK** | **12** | Serial Clock (Synchronizing system hardware beat) |
