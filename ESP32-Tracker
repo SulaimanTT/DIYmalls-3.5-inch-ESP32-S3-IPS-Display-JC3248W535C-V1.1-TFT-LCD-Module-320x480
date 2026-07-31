@@ -1,0 +1,314 @@
+#include <Arduino_GFX_Library.h>
+#include <Wire.h>
+#include <NimBLEDevice.h>
+#include "esp_mac.h"
+
+// =========================================================================
+// DISPLAY & TOUCH CONFIGURATION (AXS15231B QSPI)
+// =========================================================================
+#define TFT_BL 1
+#define QSPI_CS 45
+#define QSPI_SCK 47
+#define QSPI_D0 21
+#define QSPI_D1 48
+#define QSPI_D2 40
+#define QSPI_D3 39
+
+#define TOUCH_I2C_ADD 0x3B
+#define TOUCH_SDA 4
+#define TOUCH_SCL 8
+#define TOUCH_INT 3
+#define TOUCH_RST 38
+
+Arduino_DataBus *bus = new Arduino_ESP32QSPI(QSPI_CS, QSPI_SCK, QSPI_D0, QSPI_D1, QSPI_D2, QSPI_D3);
+Arduino_GFX *g = new Arduino_AXS15231B(bus, -1, 0, false, 320, 480);
+Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g);
+
+// =========================================================================
+// BLE SERVER CONFIGURATION & CONSTANTS
+// =========================================================================
+#define DEVICE_NAME "ESP32-Tracker"
+// Change the final character block to force iOS to clear its device dictionary
+#define SERVICE_UUID "12345678-1234-1234-1234-123456789def" 
+
+#ifndef BLE_CONN_HANDLE_INVALID
+#define BLE_CONN_HANDLE_INVALID 0xFFFF
+#endif
+
+const float EMA_ALPHA = 0.20;    
+const int THRESHOLD_HOT  = -60;  
+const int THRESHOLD_WARM = -78;  
+
+// RGB565 Colors
+#define COLOR_BG        0x0000 
+#define COLOR_TEXT      0xFFFF 
+#define COLOR_GRAY      0x7BEF
+#define COLOR_HOT       0xF800 
+#define COLOR_WARM      0xFD20 
+#define COLOR_COLD      0x001F 
+#define COLOR_DARK_GRAY 0x2104
+
+// State Tracking
+NimBLEServer* pServer = nullptr;
+uint16_t activeConnId = BLE_CONN_HANDLE_INVALID;
+volatile bool deviceConnected = false;
+volatile bool stateChanged = true; // Forces baseline visual initialization
+
+float smoothedRSSI = -999.0;
+int rawRSSI = 0;
+unsigned long lastRssiReadTime = 0;
+
+// Cache states to trap redundancies
+float lastRenderedRSSI = -999.0;
+bool lastRenderedConnection = false;
+
+// Forward Declarations
+bool getTouch(int &x, int &y);
+void drawUI();
+
+// =========================================================================
+// BLE SERVER CALLBACKS
+// =========================================================================
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+        deviceConnected = true;
+        activeConnId = connInfo.getConnHandle();
+        smoothedRSSI = -999.0; 
+        stateChanged = true;
+        Serial.printf("iPhone Connected! Handle ID: %d\n", activeConnId);
+    }
+
+    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+        deviceConnected = false;
+        activeConnId = BLE_CONN_HANDLE_INVALID;
+        smoothedRSSI = -999.0;
+        stateChanged = true;
+        Serial.println("iPhone Disconnected. Advertising restarted...");
+        NimBLEDevice::startAdvertising();
+    }
+};
+
+// =========================================================================
+// SETUP (WITH HID KEYBOARD EMULATION TRICK)
+// =========================================================================
+void setup() {
+  Serial.begin(115200);
+
+  // 1. Initialize Screen Hardware
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  pinMode(TOUCH_RST, OUTPUT);
+  digitalWrite(TOUCH_RST, HIGH); 
+  delay(100);
+
+  Wire.begin(TOUCH_SDA, TOUCH_SCL);
+
+  if (!gfx->begin()) {
+    Serial.println("Error gfx->begin()!");
+    while(1);
+  }
+
+  // 2. Initialize NimBLE Server
+  NimBLEDevice::init(DEVICE_NAME);
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  // Create main tracker service 
+  NimBLEService* pService = pServer->createService(SERVICE_UUID);
+  pService->start();
+
+  // EMULATE A MOUSE/KEYBOARD (0x1812) TO BYPASS IPHONE SYSTEM RULES
+  NimBLEService* pHidService = pServer->createService(NimBLEUUID((uint16_t)0x1812));
+  pHidService->start();
+
+  // 3. Configure BLE Advertising to alert the system core
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  
+  NimBLEAdvertisementData advData;
+  NimBLEAdvertisementData scanResponseData;
+
+  // 0x03C1 is the standard target appearance ID for a wireless keyboard
+  pAdvertising->setAppearance(0x03C1); 
+
+  // Standard discoverable flags
+  advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+  advData.setName(DEVICE_NAME);
+  
+  // Broadcast both services
+  advData.setCompleteServices(NimBLEUUID(SERVICE_UUID));
+  scanResponseData.setName(DEVICE_NAME);
+
+  pAdvertising->setAdvertisementData(advData);
+  pAdvertising->setScanResponseData(scanResponseData);
+
+  // Start broadcasting
+  NimBLEDevice::startAdvertising();
+
+  Serial.println("ESP32 Emulated Keyboard ready. Check iPhone Settings!");
+  drawUI();
+}
+
+
+
+
+// =========================================================================
+// MAIN LOOP
+// =========================================================================
+void loop() {
+  // 1. Handle Reset Touch Input
+  int tx, ty;
+  if (getTouch(tx, ty)) {
+    if (tx > 220 && tx < 310 && ty > 10 && ty < 50) {
+      smoothedRSSI = -999.0;
+      stateChanged = true;
+      delay(150); 
+    }
+  }
+
+  // 2. Poll BLE Signals conditionally
+  if (deviceConnected && activeConnId != BLE_CONN_HANDLE_INVALID) {
+    if (millis() - lastRssiReadTime > 150) {
+      lastRssiReadTime = millis();
+      int8_t rssi_val = 0;
+if (ble_gap_conn_rssi(activeConnId, &rssi_val) == 0) {
+    rawRSSI = rssi_val;
+} else {
+    rawRSSI = -999; // Error fallback if reading failed
+}
+
+
+      if (rawRSSI != 0 && rawRSSI != -999) {
+        float previousRSSI = smoothedRSSI;
+        if (smoothedRSSI == -999.0) {
+          smoothedRSSI = (float)rawRSSI;
+        } else {
+          smoothedRSSI = (EMA_ALPHA * rawRSSI) + ((1.0 - EMA_ALPHA) * smoothedRSSI);
+        }
+        
+        // Flag visual modifications only when meaningful adjustments manifest
+        if (abs(smoothedRSSI - previousRSSI) > 0.2 || deviceConnected != lastRenderedConnection) {
+          stateChanged = true;
+        }
+      }
+    }
+  }
+
+  // 3. Conditional Frame-Buffer Refresh execution
+  if (stateChanged) {
+    stateChanged = false; // Reset rendering trap
+    drawUI();
+    lastRenderedRSSI = smoothedRSSI;
+    lastRenderedConnection = deviceConnected;
+  }
+
+  delay(10);
+}
+
+// =========================================================================
+// UI RENDERER
+// =========================================================================
+void drawUI() {
+  gfx->fillScreen(COLOR_BG);
+
+  // --- Header ---
+  gfx->setCursor(10, 20);
+  gfx->setTextSize(2);
+  gfx->setTextColor(COLOR_TEXT);
+  gfx->print("BLE TRACKER");
+
+  gfx->setCursor(10, 45);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_GRAY);
+  gfx->printf("Device: %s", DEVICE_NAME);
+
+  // RESET Button
+  gfx->fillRect(220, 10, 90, 35, COLOR_DARK_GRAY);
+  gfx->drawRect(220, 10, 90, 35, COLOR_GRAY);
+  gfx->setCursor(238, 22);
+  gfx->setTextSize(2);
+  gfx->setTextColor(COLOR_TEXT);
+  gfx->print("RESET");
+
+  // --- Proximity Radar Card ---
+  uint16_t statusColor = COLOR_DARK_GRAY;
+  String statusText = "WAITING...";
+
+  if (deviceConnected) {
+    if (smoothedRSSI != -999.0) {
+      if (smoothedRSSI >= THRESHOLD_HOT) {
+        statusColor = COLOR_HOT;
+        statusText = "HOT";
+      } else if (smoothedRSSI >= THRESHOLD_WARM) {
+        statusColor = COLOR_WARM;
+        statusText = "WARM";
+      } else {
+        statusColor = COLOR_COLD;
+        statusText = "COLD";
+      }
+    } else {
+      statusText = "LINKED";
+    }
+  }
+
+  // Large Status Card
+  gfx->fillRoundRect(10, 75, 300, 190, 12, statusColor);
+  gfx->drawRoundRect(10, 75, 300, 190, 12, COLOR_TEXT);
+
+  // Center alignment for status label
+  gfx->setTextColor(COLOR_TEXT);
+  gfx->setTextSize(4);
+  int xOffset = (320 - (statusText.length() * 24)) / 2;
+  gfx->setCursor(xOffset, 150);
+  gfx->print(statusText);
+
+  // --- RSSI Signal Meter Bar ---
+  gfx->drawRect(10, 285, 300, 30, COLOR_GRAY);
+  
+  if (deviceConnected && smoothedRSSI != -999.0) {
+    int fillWidth = map((int)smoothedRSSI, -95, -40, 0, 296);
+    fillWidth = constrain(fillWidth, 0, 296);
+
+    gfx->fillRect(12, 287, fillWidth, 26, statusColor);
+
+    // Readout Text
+    gfx->setCursor(10, 330);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_TEXT);
+    gfx->printf("Filtered: %.1f dBm", smoothedRSSI);
+
+    gfx->setCursor(10, 360);
+    gfx->setTextSize(1);
+    gfx->setTextColor(COLOR_GRAY);
+    gfx->printf("Raw Instantaneous: %d dBm", rawRSSI);
+  } else {
+    gfx->setCursor(10, 330);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_GRAY);
+    gfx->print(deviceConnected ? "Reading signal..." : "Connect phone via BLE");
+  }
+
+  gfx->flush();
+}
+
+// =========================================================================
+// TOUCH READER (AXS15231B I2C)
+// =========================================================================
+bool getTouch(int &x, int &y) {
+  uint8_t read_cmd[] = {0xB5, 0xAB, 0xA5, 0x5A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00};
+  uint8_t data[8] = {0};
+
+  Wire.beginTransmission(TOUCH_I2C_ADD);
+  Wire.write(read_cmd, sizeof(read_cmd));
+  if (Wire.endTransmission() != 0) return false;
+
+  if (Wire.requestFrom(TOUCH_I2C_ADD, 8) == 8) {
+    for (int i = 0; i < 8; i++) data[i] = Wire.read();
+
+    if (data[0] == 0 && data[1] != 0) {
+      x = ((data[2] & 0x0F) << 8) | data[3];
+      y = ((data[4] & 0x0F) << 8) | data[5];
+      return true;
+    }
+  }
+  return false;
+}
