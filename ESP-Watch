@@ -1,0 +1,660 @@
+#include <Arduino_GFX_Library.h>
+#include <Wire.h>
+#include <NimBLEDevice.h>
+
+// =========================================================================
+// DISPLAY & TOUCH CONFIGURATION (AXS15231B QSPI)
+// =========================================================================
+#define TFT_BL 1
+#define QSPI_CS 45
+#define QSPI_SCK 47
+#define QSPI_D0 21
+#define QSPI_D1 48
+#define QSPI_D2 40
+#define QSPI_D3 39
+
+#define TOUCH_I2C_ADD 0x3B
+#define TOUCH_SDA 4
+#define TOUCH_SCL 8
+#define TOUCH_INT 3
+#define TOUCH_RST 38
+
+Arduino_DataBus *bus = new Arduino_ESP32QSPI(QSPI_CS, QSPI_SCK, QSPI_D0, QSPI_D1, QSPI_D2, QSPI_D3);
+Arduino_GFX *g = new Arduino_AXS15231B(bus, -1, 0, false, 320, 480);
+Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, true);
+
+// =========================================================================
+// BLE IDENTITY & ANCS DEFINITIONS
+// =========================================================================
+#define DEVICE_NAME "ESP-Watch"
+#define DEVICE_APPEARANCE 0x00C0 // Generic Watch
+
+#define DIS_MANUFACTURER "Custom Builds"
+#define DIS_MODEL "ESP32-S3 Watch"
+#define DIS_FIRMWARE_REV "1.0.0"
+
+#define ANCS_SERVICE_UUID "7905F431-B5CE-4E99-A40F-4B1E122D00D0"
+#define ANCS_NOTIF_SRC    "9FBF120D-6301-42D9-8C58-25E699A21DBD"
+#define ANCS_CTRL_PT      "69D1D8F3-45E1-49A8-9821-9BBDFDAAD9D9"
+#define ANCS_DATA_SOURCE  "22EAC6E9-24D6-4BB5-BE44-B36ACE7C7BFB"
+
+#define CTS_SERVICE_UUID "1805"
+#define CTS_CURRENT_TIME_CHAR "2A2B"
+#define BAS_SERVICE_UUID "180F"
+#define BAS_BATTERY_LEVEL_CHAR "2A19"
+
+#ifndef BLE_CONN_HANDLE_INVALID
+#define BLE_CONN_HANDLE_INVALID 0xFFFF
+#endif
+
+// RGB565 Colors
+#define COLOR_BG        0x0000
+#define COLOR_TEXT      0xFFFF
+#define COLOR_BLACK     0x0000
+#define COLOR_GRAY      0x7BEF
+#define COLOR_DARK_GRAY 0x2104
+#define COLOR_BAR_BLUE  0x01CF
+
+// =========================================================================
+// STATE & QUEUES
+// =========================================================================
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pOwnBatteryLevelChar = nullptr;
+
+uint16_t activeConnId = BLE_CONN_HANDLE_INVALID;
+volatile bool deviceConnected = false;
+volatile bool stateChanged = true;
+
+bool securityRequestPending = false;
+unsigned long securityRequestAtMillis = 0;
+const unsigned long SECURITY_REQUEST_DELAY_MS = 500;
+
+bool pendingSync = false;
+unsigned long syncAtMillis = 0;
+const unsigned long SYNC_DELAY_MS = 600;
+
+unsigned long lastUIRedraw = 0;
+
+// Watchdog & Startup Flush State
+bool ancsRequestInFlight = false;
+unsigned long ancsRequestSentTime = 0;
+const unsigned long ANCS_REQUEST_TIMEOUT_MS = 2500;
+unsigned long ancsReadyTime = 0; 
+
+// Telemetry
+int iphoneBattery = -1;
+String currentTimeStr = "--:--";
+String currentDateStr = "--/--";
+
+unsigned long clockTargetInterval = 60000;
+unsigned long lastClockTickTimestamp = 0;
+bool clockIsSynchronized = false;
+int currentHour = -1;
+int currentMinute = -1;
+
+uint8_t ownBatteryLevel = 100;
+
+// Notification Data Structure
+struct NotificationItem {
+  uint32_t uid;
+  String title;
+  String message;
+};
+NotificationItem notifList[4];
+int notifCount = 0;
+
+QueueHandle_t ancsUidQueue = nullptr;
+
+// Forward declarations
+bool getTouch(int &x, int &y);
+void drawUI();
+void syncIphoneData(uint16_t connId);
+void processANCSQueue();
+
+// =========================================================================
+// BLE NOTIFICATION CALLBACKS
+// =========================================================================
+void timeNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+  if (length >= 7) {
+    int month = pData[2];
+    int day = pData[3];
+    currentHour = pData[4];
+    currentMinute = pData[5];
+    int seconds = pData[6];
+
+    char timeBuf[6];
+    char dateBuf[6];
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", currentHour, currentMinute);
+    snprintf(dateBuf, sizeof(dateBuf), "%02d/%02d", day, month);
+
+    currentTimeStr = String(timeBuf);
+    currentDateStr = String(dateBuf);
+
+    unsigned long msPastCurrentMinute = (seconds * 1000);
+    clockTargetInterval = 60000 - msPastCurrentMinute;
+
+    lastClockTickTimestamp = millis();
+    clockIsSynchronized = true;
+    stateChanged = true;
+  }
+}
+
+void batteryNotifyCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+  if (length > 0) {
+    iphoneBattery = pData[0];
+    stateChanged = true;
+  }
+}
+
+void ancsNotificationCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+  if (length < 8) return;
+
+  uint8_t eventId = pData[0];    // 0x00 = Added, 0x01 = Modified, 0x02 = Removed
+  uint8_t eventFlags = pData[1]; 
+  uint8_t categoryId = pData[2]; 
+  uint32_t uid = pData[4] | (pData[5] << 8) | (pData[6] << 16) | (pData[7] << 24);
+
+  // STARTUP FLUSH: Ignore notifications sent in the first 3 seconds of connection.
+  if (ancsReadyTime == 0 || millis() - ancsReadyTime < 3000) {
+    Serial.printf("[ANCS] Ignoring startup ghost sync event. UID: %u\n", uid);
+    return;
+  }
+
+  // Pre-Existing flag check
+  bool isPreExisting = (eventFlags & 0x04) != 0;
+
+  Serial.printf("\n[ANCS EVENT] EventID: %d | Flags: 0x%02X | Cat: %d | UID: %u\n", eventId, eventFlags, categoryId, uid);
+
+  if (uid == 0 || isPreExisting) {
+    Serial.println("[ANCS] Ignoring system/old notification.");
+    return;
+  }
+
+  // Process ONLY Brand New Notifications (0x00 or 0x01)
+  if (eventId == 0x00 || eventId == 0x01) {
+    Serial.printf("[ANCS] Brand new notification detected! Queuing UID: %u\n", uid);
+    if (ancsUidQueue != nullptr) {
+      xQueueSend(ancsUidQueue, &uid, 0);
+    }
+  }
+}
+
+void ancsDataCallback(NimBLERemoteCharacteristic* pChar, uint8_t* pData, size_t length, bool isNotify) {
+  static uint8_t rxBuf[1024]; 
+  static size_t rxLen = 0;
+  static uint32_t currentUid = 0;
+
+  if (length == 0) return;
+
+  // Header check: 0x00 signifies start of new attribute response stream
+  if (rxLen == 0) {
+    if (pData[0] == 0x00 && length >= 5) {
+      currentUid = pData[1] | (pData[2] << 8) | (pData[3] << 16) | (pData[4] << 24);
+    } else {
+      return; 
+    }
+  }
+
+  if (rxLen + length <= sizeof(rxBuf)) {
+    memcpy(rxBuf + rxLen, pData, length);
+    rxLen += length;
+  } else {
+    Serial.println("[ANCS] Buffer overflow! Resetting.");
+    rxLen = 0;
+    ancsRequestInFlight = false;
+    return;
+  }
+
+  if (rxLen < 5) return;
+
+  size_t idx = 5;
+  String extractedTitle = "";
+  String extractedMsg = "";
+  bool parseComplete = true;
+
+  while (idx < rxLen) {
+    if (idx + 3 > rxLen) {
+      parseComplete = false;
+      break;
+    }
+
+    uint8_t attrId = rxBuf[idx];
+    uint16_t attrLen = rxBuf[idx + 1] | (rxBuf[idx + 2] << 8);
+
+    if (idx + 3 + attrLen > rxLen) {
+      parseComplete = false;
+      break;
+    }
+
+    idx += 3; // Move to text content
+
+    String content = "";
+    content.reserve(attrLen);
+    for (uint16_t i = 0; i < attrLen; i++) {
+      uint8_t c = rxBuf[idx + i];
+      if (c >= 32 && c <= 126) {
+        content += (char)c;
+      }
+    }
+
+    if (attrId == 0x01) extractedTitle = content;
+    if (attrId == 0x03) extractedMsg = content;
+
+    idx += attrLen; // Move past this attribute
+  }
+
+  if (parseComplete) {
+    Serial.println("===================================");
+    Serial.printf("ANCS NOTIFICATION PROCESSED!\n");
+    Serial.printf("UID:     %u\n", currentUid);
+    Serial.printf("Title:   %s\n", extractedTitle.length() > 0 ? extractedTitle.c_str() : "(No Title)");
+    Serial.printf("Message: %s\n", extractedMsg.length() > 0 ? extractedMsg.c_str() : "(No Text)");
+    Serial.println("===================================");
+
+    for (int i = 3; i > 0; i--) {
+      notifList[i] = notifList[i - 1];
+    }
+    notifList[0] = { currentUid, extractedTitle, extractedMsg };
+    if (notifCount < 4) notifCount++;
+    
+    stateChanged = true;
+    rxLen = 0;
+    ancsRequestInFlight = false; // Unlock queue for next notification
+  }
+}
+
+// =========================================================================
+// GATT DISCOVERY & SUBSCRIPTION
+// =========================================================================
+void syncIphoneData(uint16_t connId) {
+  Serial.println("[BLE] Discovering iPhone services...");
+  NimBLEClient* pClient = NimBLEDevice::getServer()->getClient(connId);
+  if (!pClient) return;
+
+  // 1. Time Service
+  NimBLERemoteService* pTimeSvc = pClient->getService(CTS_SERVICE_UUID);
+  if (pTimeSvc) {
+    NimBLERemoteCharacteristic* pTimeChar = pTimeSvc->getCharacteristic(CTS_CURRENT_TIME_CHAR);
+    if (pTimeChar) {
+      if (pTimeChar->canNotify()) pTimeChar->subscribe(true, timeNotifyCallback);
+      std::string rawData = pTimeChar->readValue();
+      if (rawData.length() >= 7) timeNotifyCallback(pTimeChar, (uint8_t*)rawData.data(), rawData.length(), false);
+      delay(50);
+    }
+  }
+
+  // 2. Battery Service
+  NimBLERemoteService* pBatSvc = pClient->getService(BAS_SERVICE_UUID);
+  if (pBatSvc) {
+    NimBLERemoteCharacteristic* pBatChar = pBatSvc->getCharacteristic(BAS_BATTERY_LEVEL_CHAR);
+    if (pBatChar) {
+      if (pBatChar->canNotify()) pBatChar->subscribe(true, batteryNotifyCallback);
+      std::string batData = pBatChar->readValue();
+      if (batData.length() > 0) iphoneBattery = (uint8_t)batData[0];
+      delay(50);
+    }
+  }
+
+  // 3. ANCS Service
+  NimBLERemoteService* pAncsSvc = pClient->getService(ANCS_SERVICE_UUID);
+  if (pAncsSvc) {
+    Serial.println("[ANCS] ANCS Service found! Subscribing...");
+    NimBLERemoteCharacteristic* pNotifChar = pAncsSvc->getCharacteristic(ANCS_NOTIF_SRC);
+    NimBLERemoteCharacteristic* pDataChar = pAncsSvc->getCharacteristic(ANCS_DATA_SOURCE);
+
+    if (pNotifChar && pDataChar) {
+      // Must subscribe to Data Source FIRST per Apple spec
+      bool subData = pDataChar->subscribe(true, ancsDataCallback);
+      Serial.printf("[ANCS] Data Source Subscription: %s\n", subData ? "SUCCESS" : "FAILED");
+
+      delay(200);
+
+      bool subNotif = pNotifChar->subscribe(true, ancsNotificationCallback);
+      Serial.printf("[ANCS] Notification Source Subscription: %s\n", subNotif ? "SUCCESS" : "FAILED");
+    }
+  } else {
+    Serial.println("[ANCS] ERROR: ANCS Service NOT found on iPhone!");
+  }
+
+  // Start the 3-second grace period timer
+  ancsReadyTime = millis();
+  if (ancsReadyTime == 0) ancsReadyTime = 1; // Prevent 0 bug
+
+  stateChanged = true;
+}
+
+// =========================================================================
+// QUEUE WORKER
+// =========================================================================
+void processANCSQueue() {
+  if (ancsRequestInFlight) {
+    if (millis() - ancsRequestSentTime > ANCS_REQUEST_TIMEOUT_MS) {
+      Serial.println("[ANCS] Watchdog Timeout: iPhone took too long to reply. Clearing queue lock.");
+      ancsRequestInFlight = false;
+    } else {
+      return; 
+    }
+  }
+
+  uint32_t uid;
+  if (ancsUidQueue == nullptr || xQueueReceive(ancsUidQueue, &uid, 0) != pdTRUE) {
+    return;
+  }
+
+  if (!deviceConnected || activeConnId == BLE_CONN_HANDLE_INVALID) return;
+
+  NimBLEClient* pClient = NimBLEDevice::getServer()->getClient(activeConnId);
+  if (!pClient) return;
+
+  NimBLERemoteService* pAncsSvc = pClient->getService(ANCS_SERVICE_UUID);
+  if (pAncsSvc) {
+    NimBLERemoteCharacteristic* pCtrlChar = pAncsSvc->getCharacteristic(ANCS_CTRL_PT);
+    if (pCtrlChar) {
+      
+      // Standard 12-byte payload to request App Name, Title, and Message
+      uint8_t cmdBuf[] = {
+        0x00,                           // Command ID: GetNotificationAttributes
+        (uint8_t)(uid & 0xFF),          // UID LSB
+        (uint8_t)((uid >> 8) & 0xFF),
+        (uint8_t)((uid >> 16) & 0xFF),
+        (uint8_t)((uid >> 24) & 0xFF),  // UID MSB
+        0x00,                           // AttrID 0: AppIdentifier
+        0x01, 0x20, 0x00,               // AttrID 1: Title (max 32 bytes)
+        0x03, 0x40, 0x00                // AttrID 3: Message (max 64 bytes)
+      };
+      
+      Serial.printf("[ANCS] Requesting text attributes for UID %u...\n", uid);
+      
+      ancsRequestInFlight = true;
+      ancsRequestSentTime = millis();
+
+      bool wrote = pCtrlChar->writeValue(cmdBuf, sizeof(cmdBuf), true);
+      
+      if (!wrote) {
+        Serial.println("[ANCS] ERROR: Control Point Write Failed!");
+        ancsRequestInFlight = false;
+      }
+    }
+  }
+}
+
+// =========================================================================
+// SERVER CALLBACKS
+// =========================================================================
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+    deviceConnected = true;
+    activeConnId = connInfo.getConnHandle();
+    stateChanged = true;
+
+    securityRequestPending = true;
+    securityRequestAtMillis = millis();
+
+    Serial.printf("[BLE] Central Connected. Handle: %d\n", activeConnId);
+  }
+
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+    deviceConnected = false;
+    activeConnId = BLE_CONN_HANDLE_INVALID;
+    securityRequestPending = false;
+    pendingSync = false;
+    clockIsSynchronized = false;
+    ancsRequestInFlight = false;
+    ancsReadyTime = 0;
+    iphoneBattery = -1;
+    currentTimeStr = "--:--";
+    currentDateStr = "--/--";
+    notifCount = 0;
+    
+    if (ancsUidQueue != nullptr) {
+      xQueueReset(ancsUidQueue);
+    }
+    
+    stateChanged = true;
+    Serial.println("[BLE] Central Disconnected. Advertising restarted.");
+    NimBLEDevice::startAdvertising();
+  }
+
+  void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+    if (!connInfo.isEncrypted()) {
+      Serial.println("[SECURITY] Pairing failed - Unencrypted link.");
+      return;
+    }
+    Serial.println("[SECURITY] Link encrypted! Scheduling GATT sync...");
+    securityRequestPending = false;
+    pendingSync = true;
+    syncAtMillis = millis();
+  }
+};
+
+// =========================================================================
+// SETUP
+// =========================================================================
+void setup() {
+  Serial.begin(115200);
+
+  ancsUidQueue = xQueueCreate(20, sizeof(uint32_t));
+
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  pinMode(TOUCH_RST, OUTPUT);
+  digitalWrite(TOUCH_RST, HIGH);
+  delay(100);
+
+  Wire.begin(TOUCH_SDA, TOUCH_SCL);
+
+  if (!gfx->begin()) {
+    Serial.println("Error gfx->begin()!");
+    while (1);
+  }
+
+  gfx->setRotation(2);
+
+  NimBLEDevice::init(DEVICE_NAME);
+  NimBLEDevice::setMTU(512); 
+  
+  NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND | BLE_SM_PAIR_AUTHREQ_SC);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* pDIS = pServer->createService("180A");
+  pDIS->createCharacteristic("2A29", NIMBLE_PROPERTY::READ)->setValue(DIS_MANUFACTURER);
+  pDIS->createCharacteristic("2A24", NIMBLE_PROPERTY::READ)->setValue(DIS_MODEL);
+  pDIS->createCharacteristic("2A26", NIMBLE_PROPERTY::READ)->setValue(DIS_FIRMWARE_REV);
+  pDIS->start();
+
+  NimBLEService* pBAS = pServer->createService(BAS_SERVICE_UUID);
+  pOwnBatteryLevelChar = pBAS->createCharacteristic(
+    BAS_BATTERY_LEVEL_CHAR,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
+  );
+  pOwnBatteryLevelChar->setValue(&ownBatteryLevel, 1);
+  pBAS->start();
+
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  NimBLEAdvertisementData advData;
+  advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
+  advData.setAppearance(DEVICE_APPEARANCE);
+
+  uint8_t ancsSolicitation[] = {
+    0x11, 0x15,
+    0xD0, 0x00, 0x2D, 0x12, 0x1E, 0x4B, 0x0F, 0xA4,
+    0x99, 0x4E, 0xCE, 0xB5, 0x31, 0xF4, 0x05, 0x79
+  };
+  advData.addData(ancsSolicitation, sizeof(ancsSolicitation));
+
+  NimBLEAdvertisementData scanResponseData;
+  scanResponseData.setName(DEVICE_NAME);
+
+  pAdvertising->setAdvertisementData(advData);
+  pAdvertising->setScanResponseData(scanResponseData);
+  pAdvertising->setMinInterval(160);
+  pAdvertising->setMaxInterval(240);
+
+  NimBLEDevice::startAdvertising();
+
+  Serial.println("ESP32 ANCS Watch Initialized. Advertising...");
+  drawUI();
+}
+
+// =========================================================================
+// LOOP
+// =========================================================================
+void loop() {
+  int tx, ty;
+  if (getTouch(tx, ty)) {
+    if (tx > 220 && tx < 310 && ty > 30 && ty < 65) {
+      if (deviceConnected && activeConnId != BLE_CONN_HANDLE_INVALID) {
+        pServer->disconnect(activeConnId);
+      }
+    }
+  }
+
+  if (securityRequestPending && (millis() - securityRequestAtMillis > SECURITY_REQUEST_DELAY_MS)) {
+    securityRequestPending = false;
+    Serial.println("[SECURITY] Requesting link encryption...");
+    NimBLEDevice::startSecurity(activeConnId);
+  }
+
+  if (pendingSync && (millis() - syncAtMillis > SYNC_DELAY_MS)) {
+    pendingSync = false;
+    syncIphoneData(activeConnId);
+  }
+
+  processANCSQueue();
+
+  if (clockIsSynchronized && (millis() - lastClockTickTimestamp >= clockTargetInterval)) {
+    lastClockTickTimestamp = millis();
+    clockTargetInterval = 60000;
+    currentMinute++;
+    if (currentMinute >= 60) {
+      currentMinute = 0;
+      currentHour++;
+      if (currentHour >= 24) currentHour = 0;
+    }
+    char timeBuf[6];
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", currentHour, currentMinute);
+    currentTimeStr = String(timeBuf);
+    stateChanged = true;
+  }
+
+  if (stateChanged && (millis() - lastUIRedraw > 50)) {
+    stateChanged = false;
+    lastUIRedraw = millis();
+    drawUI();
+  }
+
+  delay(10);
+}
+
+// =========================================================================
+// UI RENDERER
+// =========================================================================
+void drawUI() {
+  gfx->fillScreen(COLOR_BG);
+  gfx->fillRect(0, 0, 320, 20, 0xFFFF);
+  gfx->setTextColor(COLOR_BLACK);
+  gfx->setTextSize(1);
+  gfx->setCursor(6, 6);
+
+  if (deviceConnected && currentTimeStr != "--:--") {
+    gfx->printf("%s %s", currentTimeStr.c_str(), currentDateStr.c_str());
+  } else {
+    gfx->print("Not Synced");
+  }
+
+  if (deviceConnected && iphoneBattery != -1) {
+    String batStr = String(iphoneBattery) + "%";
+    gfx->setCursor(314 - (batStr.length() * 6), 6);
+    gfx->print(batStr);
+  } else {
+    gfx->setCursor(260, 6);
+    gfx->print("Bat: --");
+  }
+
+  gfx->setCursor(10, 35);
+  gfx->setTextSize(2);
+  gfx->setTextColor(COLOR_TEXT);
+  gfx->print("NOTIF CENTRE");
+
+  gfx->setCursor(10, 58);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_GRAY);
+  gfx->printf("Device: %s", deviceConnected ? "LINKED" : "OFFLINE");
+
+  gfx->fillRect(220, 30, 90, 35, COLOR_DARK_GRAY);
+  gfx->drawRect(220, 30, 90, 35, COLOR_GRAY);
+  gfx->setCursor(226, 42);
+  gfx->setTextSize(1);
+  gfx->setTextColor(COLOR_TEXT);
+  gfx->print("DISCONNECT");
+
+  int startY = 85;
+
+  if (!deviceConnected) {
+    gfx->setCursor(45, 220);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_GRAY);
+    gfx->print("Awaiting Link...");
+  } else if (notifCount == 0) {
+    gfx->setCursor(55, 220);
+    gfx->setTextSize(2);
+    gfx->setTextColor(COLOR_GRAY);
+    gfx->print("No Active Notifications");
+  } else {
+    for (int i = 0; i < notifCount; i++) {
+      int boxY = startY + (i * 90);
+      if (boxY + 80 > 480) break;
+
+      gfx->fillRoundRect(10, boxY, 300, 80, 6, COLOR_DARK_GRAY);
+      gfx->drawRoundRect(10, boxY, 300, 80, 6, COLOR_GRAY);
+      gfx->fillRect(10, boxY, 6, 80, COLOR_BAR_BLUE);
+
+      gfx->setCursor(24, boxY + 10);
+      gfx->setTextSize(2);
+      gfx->setTextColor(COLOR_TEXT);
+      if (notifList[i].title.length() > 0) {
+        gfx->print(notifList[i].title.substring(0, 20));
+      } else {
+        gfx->print("System Alert");
+      }
+
+      gfx->setCursor(24, boxY + 36);
+      gfx->setTextSize(1);
+      gfx->setTextColor(COLOR_GRAY);
+      if (notifList[i].message.length() > 0) {
+        gfx->print(notifList[i].message.substring(0, 38));
+        if (notifList[i].message.length() > 38) gfx->print("...");
+      } else {
+        gfx->print("Tap to view details on source device.");
+      }
+    }
+  }
+  gfx->flush();
+}
+
+bool getTouch(int &x, int &y) {
+  uint8_t read_cmd[] = {0xB5, 0xAB, 0xA5, 0x5A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00};
+  uint8_t data[8] = {0};
+
+  Wire.beginTransmission(TOUCH_I2C_ADD);
+  Wire.write(read_cmd, sizeof(read_cmd));
+  if (Wire.endTransmission() != 0) return false;
+
+  if (Wire.requestFrom((uint8_t)TOUCH_I2C_ADD, (uint8_t)8) == 8) {
+    for (int i = 0; i < 8; i++) {
+      data[i] = Wire.read();
+    }
+
+    if (data[0] == 0x00 && data[1] != 0x00) {
+      x = 320 - (((data[2] & 0x0F) << 8) | data[3]);
+      y = 480 - (((data[4] & 0x0F) << 8) | data[5]);
+      return true;
+    }
+  }
+
+  while (Wire.available()) Wire.read();
+  return false;
+}
