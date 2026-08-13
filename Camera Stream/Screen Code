@@ -1,0 +1,215 @@
+#include <Arduino_GFX_Library.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <TJpg_Decoder.h>
+
+// ============================================================================
+// Wi-Fi Access Point Credentials
+// ============================================================================
+const char* ssid     = "ESP32-S3-CAM";
+const char* password = "CamStream#2026!";
+
+// ============================================================================
+// Display Pinout & Bus Configuration
+// ============================================================================
+#define TFT_BL 1
+#define QSPI_CS 45
+#define QSPI_SCK 47
+#define QSPI_D0 21
+#define QSPI_D1 48
+#define QSPI_D2 40
+#define QSPI_D3 39
+
+Arduino_DataBus *bus = new Arduino_ESP32QSPI(QSPI_CS, QSPI_SCK, QSPI_D0, QSPI_D1, QSPI_D2, QSPI_D3);
+Arduino_GFX *g = new Arduino_AXS15231B(bus, -1, 0, false, 320, 480);
+Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g);
+
+// Offset parameters to center 240x320 feed on 320x480 portrait screen
+#define STREAM_X_OFFSET 40 
+#define STREAM_Y_OFFSET 80 
+
+// Safe frame buffer size
+#define JPEG_BUFFER_SIZE 65536
+uint8_t* frameBuf = NULL;
+
+// ============================================================================
+// TJpgDec Callback (Portrait orientation mapping)
+// ============================================================================
+bool tjpgOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  for (int j = 0; j < h; j++) {
+    for (int i = 0; i < w; i++) {
+      uint16_t color = bitmap[j * w + i];
+      
+      // 90-degree rotated coordinate mapping for portrait display layout
+      int16_t px = STREAM_X_OFFSET + (239 - (y + j));
+      int16_t py = STREAM_Y_OFFSET + (x + i);
+
+      if (px >= 0 && px < 320 && py >= 0 && py < 480) {
+        gfx->drawPixel(px, py, color);
+      }
+    }
+  }
+  return true; 
+}
+
+void connectToWiFi() {
+  gfx->fillRect(0, 420, 320, 40, 0x0000);
+  gfx->setCursor(20, 430);
+  gfx->setTextSize(1);
+  gfx->setTextColor(0xFFE0); // Yellow
+  gfx->print("Connecting to Wi-Fi...");
+  gfx->flush();
+
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false); // Prevents Wi-Fi modem sleep latency stalls
+  WiFi.begin(ssid, password);
+
+  Serial.print("Connecting to AP");
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+    if (retry > 30) {
+      Serial.println("\nWi-Fi timeout, retrying...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password);
+      retry = 0;
+    }
+  }
+
+  Serial.println("\nConnected to Camera AP!");
+  gfx->fillRect(0, 420, 320, 40, 0x0000);
+  gfx->setCursor(20, 430);
+  gfx->setTextColor(0x07E0); // Green
+  gfx->print("Connected! Streaming...");
+  gfx->flush();
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // Allocate RAM/PSRAM safely
+  if (psramFound()) {
+    frameBuf = (uint8_t*)ps_malloc(JPEG_BUFFER_SIZE);
+    Serial.println("Allocated JPEG Buffer in PSRAM");
+  } else {
+    frameBuf = (uint8_t*)malloc(JPEG_BUFFER_SIZE);
+    Serial.println("Allocated JPEG Buffer in Internal RAM");
+  }
+
+  if (!frameBuf) {
+    Serial.println("CRITICAL ERROR: Failed to allocate JPEG buffer!");
+    while(1);
+  }
+
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+
+  if (!gfx->begin()) {
+    Serial.println("Error initializing GFX!");
+    while (1);
+  }
+
+  gfx->setRotation(2); // 180-degree hardware adjustment
+
+  gfx->fillScreen(0x0000);
+  gfx->setCursor(20, 30);
+  gfx->setTextColor(0xFFFF);
+  gfx->setTextSize(2);
+  gfx->print("ESP32-S3 Live Stream");
+  gfx->flush();
+
+  TJpgDec.setJpgScale(1);
+  TJpgDec.setCallback(tjpgOutput);
+  TJpgDec.setSwapBytes(false);
+
+  connectToWiFi();
+}
+
+void streamCameraFeed() {
+  WiFiClient client;
+  
+  if (!client.connect("192.168.4.1", 80)) {
+    Serial.println("Connection to camera stream failed!");
+    delay(500);
+    return;
+  }
+
+  // Request HTTP stream directly
+  client.print(String("GET /stream HTTP/1.1\r\n") +
+               "Host: 192.168.4.1\r\n" +
+               "Connection: close\r\n\r\n");
+
+  uint32_t timeout = millis();
+  while (client.connected() && !client.available()) {
+    if (millis() - timeout > 3000) {
+      Serial.println("Stream request timed out!");
+      client.stop();
+      return;
+    }
+    vTaskDelay(5 / portTICK_PERIOD_MS);
+  }
+
+  size_t frameLen = 0;
+  bool inFrame = false;
+
+  while (client.connected() && WiFi.status() == WL_CONNECTED) {
+    int avail = client.available();
+    if (avail > 0) {
+      uint8_t b = client.read();
+
+      if (!inFrame) {
+        // Look for JPEG Start of Frame (0xFF, 0xD8)
+        if (b == 0xFF && client.available() && client.peek() == 0xD8) {
+          client.read(); // Consume 0xD8
+          frameBuf[0] = 0xFF;
+          frameBuf[1] = 0xD8;
+          frameLen = 2;
+          inFrame = true;
+        }
+      } else {
+        // Collect frame payload
+        if (frameLen < JPEG_BUFFER_SIZE) {
+          frameBuf[frameLen++] = b;
+          
+          // Look for JPEG End of Frame (0xFF, 0xD9)
+          if (frameLen >= 2 && frameBuf[frameLen - 2] == 0xFF && frameBuf[frameLen - 1] == 0xD9) {
+            // Render frame
+            TJpgDec.drawJpg(0, 0, frameBuf, frameLen);
+            gfx->flush();
+            
+            // LOW-LATENCY FIX: Clear out lingering socket buffer queue to skip stale frames
+            while (client.available() > (JPEG_BUFFER_SIZE / 2)) {
+              client.read();
+            }
+
+            inFrame = false;
+            frameLen = 0;
+            vTaskDelay(1); // Yield for core processes
+          }
+        } else {
+          // Reset on buffer overflow
+          inFrame = false;
+          frameLen = 0;
+        }
+      }
+    } else {
+      vTaskDelay(1);
+    }
+  }
+  client.stop();
+}
+
+void loop() {
+  if (WiFi.status() == WL_CONNECTED) {
+    streamCameraFeed();
+  } else {
+    Serial.println("Wi-Fi disconnected! Reconnecting...");
+    connectToWiFi();
+  }
+}
